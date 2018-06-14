@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"regexp"
@@ -21,9 +22,11 @@ const (
 	storageAccount = "openshiftimages"
 	container      = "images"
 	keepImages     = 5
-	blobTimeout    = 6 * time.Hour
+	buildTimeout   = 6 * time.Hour
 	groupTimeout   = 3 * 24 * time.Hour
 )
+
+var dryRun = flag.Bool("n", false, "dry-run")
 
 type byName []compute.Image
 
@@ -100,6 +103,10 @@ func deleteGroups(groups []resources.Group) error {
 	var futures []resources.GroupsDeleteFuture
 	for _, group := range groups {
 		fmt.Printf("delete group %s\n", *group.Name)
+		if *dryRun {
+			continue
+		}
+
 		future, err := clients.groups.Delete(context.Background(), *group.Name)
 		if err != nil {
 			return err
@@ -121,6 +128,10 @@ func deleteImages(images []compute.Image) error {
 	var futures []compute.ImagesDeleteFuture
 	for _, image := range images {
 		fmt.Printf("delete image %s\n", *image.Name)
+		if *dryRun {
+			continue
+		}
+
 		future, err := clients.images.Delete(context.Background(), resourceGroup, *image.Name)
 		if err != nil {
 			return err
@@ -138,9 +149,41 @@ func deleteImages(images []compute.Image) error {
 	return nil
 }
 
-// purgeImages removes images from the "images" resourcegroup, leaving only the
-// `keepImages` most recent images of each kind.
-func purgeImages() error {
+// purgeInvalidImages removes images from the "images" resourcegroup that are
+// not tagged "valid: true" and which are older than `buildTimeout`.
+func purgeInvalidImages() error {
+	imageRx := regexp.MustCompile(`^.*-([0-9]{12})$`)
+
+	images, err := listImages()
+	if err != nil {
+		return err
+	}
+
+	var toDelete []compute.Image
+	for _, image := range images {
+		m := imageRx.FindStringSubmatch(*image.Name)
+		if m == nil {
+			toDelete = append(toDelete, image)
+			continue
+		}
+
+		t, err := time.Parse("200601021504", m[1])
+		if err == nil && now.Sub(t) < buildTimeout {
+			continue
+		}
+
+		v := image.Tags["valid"]
+		if v == nil || *v != "true" {
+			toDelete = append(toDelete, image)
+		}
+	}
+
+	return deleteImages(toDelete)
+}
+
+// purgeOldImages removes images from the "images" resourcegroup, leaving only
+// the `keepImages` most recent images of each kind.
+func purgeOldImages() error {
 	imageRx := regexp.MustCompile(`^(.*)-[0-9]{12}$`)
 
 	images, err := listImages()
@@ -151,22 +194,20 @@ func purgeImages() error {
 	sort.Sort(sort.Reverse(byName(images)))
 
 	var toDelete []compute.Image
-	{
-		var lastPrefix *string
-		var i int
-		for _, image := range images {
-			m := imageRx.FindStringSubmatch(*image.Name)
-			switch {
-			case m == nil:
+	var lastPrefix *string
+	var i int
+	for _, image := range images {
+		m := imageRx.FindStringSubmatch(*image.Name)
+		switch {
+		case m == nil:
+			toDelete = append(toDelete, image)
+		case lastPrefix == nil || m[1] != *lastPrefix:
+			lastPrefix = &m[1]
+			i = 1
+		default:
+			i++
+			if i > keepImages {
 				toDelete = append(toDelete, image)
-			case lastPrefix == nil || m[1] != *lastPrefix:
-				lastPrefix = &m[1]
-				i = 1
-			default:
-				i++
-				if i > keepImages {
-					toDelete = append(toDelete, image)
-				}
 			}
 		}
 	}
@@ -176,7 +217,7 @@ func purgeImages() error {
 
 // purgeBlobs removes all blobs from `storageAccount`/`container` which do not
 // have a matching image in `resourceGroup` and which are older than
-// `blobTimeout`.
+// `buildTimeout`.
 func purgeBlobs() error {
 	blobRx := regexp.MustCompile(`-([0-9]{12})\.vhd$`)
 
@@ -203,11 +244,15 @@ func purgeBlobs() error {
 		}
 		if m := blobRx.FindStringSubmatch(blob.Name); m != nil {
 			t, err := time.Parse("200601021504", m[1])
-			if err == nil && now.Sub(t) < blobTimeout {
+			if err == nil && now.Sub(t) < buildTimeout {
 				continue
 			}
 		}
 		fmt.Printf("delete blob %s\n", blob.Name)
+		if *dryRun {
+			continue
+		}
+
 		if err = blob.Delete(nil); err != nil {
 			return err
 		}
@@ -245,7 +290,11 @@ func run() error {
 		return err
 	}
 
-	if err := purgeImages(); err != nil {
+	if err := purgeInvalidImages(); err != nil {
+		return err
+	}
+
+	if err := purgeOldImages(); err != nil {
 		return err
 	}
 
@@ -261,6 +310,8 @@ func run() error {
 }
 
 func main() {
+	flag.Parse()
+
 	if err := run(); err != nil {
 		panic(err)
 	}
